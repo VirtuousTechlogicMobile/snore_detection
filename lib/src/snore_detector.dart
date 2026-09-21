@@ -232,11 +232,17 @@ class SnoreDetector {
   /// - [onError]: Called if an error occurs during recording or inference
   /// - [confidenceThreshold]: Minimum confidence (0.0-1.0) required to classify as snoring. Default: 0.5
   /// - [verboseDebug]: Enable verbose console logging for debugging. Default: false
-  /// - [enableRecording]: If `true`, automatically records audio clips when snoring is detected. Default: false
-  /// - [recordingStartDelay]: Minimum continuous snore duration before starting a recording. Default: 3 seconds
-  /// - [recordingStopDelay]: Minimum continuous noise duration before stopping a recording. Default: 2 seconds
+  /// - [enableRecording]: If `true`, automatically records snore episodes. Default: false
+  /// - [episodeOpenSnoreCount]: Discrete snores required to open. Default: 3
+  /// - [episodeOpenWindow]: Candidate window. Default: 22s ((count-1)*11s)
+  /// - [episodeCloseSilence]: Quiet since last snore event end before close. Default: 11s
+  /// - [minEpisodeDuration]: Optional duration floor (zero = off). Default: 0
+  /// - [minInterSnoreGap] / [maxInterSnoreGap]: Event spacing gate. Default: 2s–11s
+  /// - [snoreBurstEndSilence]: Quiet needed to end one discrete snore burst. Default: 2s
+  /// - [requireMinSnoreEventsToSave]: Discard if event count < open count. Default: true
   /// - [fileNameBuilder]: Optional callback to generate custom filenames. If null, uses default format.
-  /// - [onRecordingSaved]: Optional callback invoked when a recording is saved.
+  /// - [onRecordingSaved]: Invoked when a kept episode is saved.
+  /// - [onEpisodeDiscarded]: Invoked when an episode is discarded.
   ///
   /// **Returns:** A [Stream] of [DetectionResult]s that emits once per second
   ///
@@ -249,11 +255,10 @@ class SnoreDetector {
   /// - iOS: Add `NSMicrophoneUsageDescription` to Info.plist
   /// - Android: Add `RECORD_AUDIO` permission to AndroidManifest.xml
   ///
-  /// **Recording Behavior:**
-  /// - When `enableRecording` is `true`, the library automatically records audio when snoring is detected.
-  /// - Snore episodes shorter than `recordingStartDelay` do not create recordings.
-  /// - Brief noise interruptions shorter than `recordingStopDelay` do not split recordings.
-  /// - Each distinct snore episode becomes one audio file.
+  /// **Recording Behavior (episode heuristic):**
+  /// - Opens after 3 consecutive discrete snores with gaps 2–11s.
+  /// - Closes after 11s with no new snore event (from event end).
+  /// - Saves if ≥3 snore events; no 60s duration floor by default.
   ///
   /// Example:
   /// ```dart
@@ -263,10 +268,8 @@ class SnoreDetector {
   ///     print('Snoring: ${result.isSnoring}');
   ///   },
   ///   enableRecording: true,
-  ///   recordingStartDelay: const Duration(seconds: 3),
-  ///   recordingStopDelay: const Duration(seconds: 2),
   ///   onRecordingSaved: (info) {
-  ///     print('Saved: ${info.filePath}, duration: ${info.duration.inSeconds}s');
+  ///     print('Saved episode: ${info.filePath}, ${info.duration.inSeconds}s');
   ///   },
   /// );
   /// ```
@@ -276,10 +279,18 @@ class SnoreDetector {
     double confidenceThreshold = 0.5,
     bool verboseDebug = false,
     bool enableRecording = false,
-    Duration recordingStartDelay = const Duration(seconds: 3),
-    Duration recordingStopDelay = const Duration(seconds: 2),
+    int episodeOpenSnoreCount = 3,
+    Duration? episodeOpenWindow,
+    Duration episodeCloseSilence = const Duration(seconds: 11),
+    Duration minEpisodeDuration = Duration.zero,
+    Duration minInterSnoreGap = const Duration(seconds: 2),
+    Duration maxInterSnoreGap = const Duration(seconds: 11),
+    Duration snoreBurstEndSilence = const Duration(seconds: 2),
+    bool requireMinSnoreEventsToSave = true,
+    bool measureGapsFromEventEnd = true,
     String Function(int index, DateTime startTimestamp)? fileNameBuilder,
     void Function(SnoreRecordingInfo info)? onRecordingSaved,
+    void Function(Duration duration)? onEpisodeDiscarded,
   }) async {
     _ensureInitialized();
 
@@ -297,13 +308,28 @@ class SnoreDetector {
 
     _currentThreshold = confidenceThreshold;
 
+    final resolvedOpenWindow = episodeOpenWindow ??
+        Duration(
+          milliseconds:
+              (episodeOpenSnoreCount - 1) * maxInterSnoreGap.inMilliseconds,
+        );
+
     // Initialize recording state machine if recording is enabled
     if (enableRecording) {
       _recordingStateMachine = RecordingStateMachine(
-        recordingStartDelay: recordingStartDelay,
-        recordingStopDelay: recordingStopDelay,
+        episodeOpenSnoreCount: episodeOpenSnoreCount,
+        episodeOpenWindow: resolvedOpenWindow,
+        episodeCloseSilence: episodeCloseSilence,
+        minEpisodeDuration: minEpisodeDuration,
+        minInterSnoreGap: minInterSnoreGap,
+        maxInterSnoreGap: maxInterSnoreGap,
+        snoreBurstEndSilence: snoreBurstEndSilence,
+        requireMinSnoreEventsToSave: requireMinSnoreEventsToSave,
+        measureGapsFromEventEnd: measureGapsFromEventEnd,
         fileNameBuilder: fileNameBuilder,
         onRecordingSaved: onRecordingSaved,
+        onEpisodeDiscarded: onEpisodeDiscarded,
+        storageService: _storageService,
       );
     }
 
@@ -454,6 +480,12 @@ class SnoreDetector {
     }
   }
 
+  /// Finalizes the current episode (save/discard) without stopping the mic.
+  /// Prefer [stopLiveDetection] when pausing/ending a session.
+  Future<void> finalizeActiveEpisode() async {
+    await _recordingStateMachine?.finalizeActiveEpisode();
+  }
+
   /// Detects snoring from a pre-recorded audio file.
   ///
   /// Analyzes the audio file in 1-second windows and returns results for each window.
@@ -536,8 +568,14 @@ class SnoreDetector {
     final features = AudioProcessor.computeSpectrogramFeatures(normalizedAudio);
 
     // Run inference with current threshold
-    return await _tfliteService.runInference(features,
+    final result = await _tfliteService.runInference(features,
         threshold: _currentThreshold);
+
+    final hz = result.isSnoring
+        ? AudioProcessor.estimateDominantFrequencyHz(normalizedAudio)
+        : 0.0;
+
+    return result.copyWith(dominantFrequencyHz: hz);
   }
 
   /// Read and preprocess audio file

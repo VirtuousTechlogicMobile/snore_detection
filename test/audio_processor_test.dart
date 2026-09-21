@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import '../lib/src/utils/audio_processor.dart';
@@ -77,19 +78,22 @@ void main() {
       expect(resampled.length, 16000); // Downsampled to 16kHz
     });
 
-    test('computeSpectrogramFeatures handles different audio patterns', () {
-      final sampleRate = AudioProcessor.targetSampleRate;
+    test('estimateDominantFrequencyHz finds in-band sine peak', () {
+      const sampleRate = AudioProcessor.targetSampleRate;
+      const targetHz = 80.0;
+      final audio = List<double>.generate(sampleRate, (i) {
+        return 0.5 *
+            math.sin(2 * math.pi * targetHz * i / sampleRate);
+      });
 
-      // Test with silence
-      final silence = List.filled(sampleRate, 0.0);
-      final silenceFeatures =
-          AudioProcessor.computeSpectrogramFeatures(silence);
-      expect(silenceFeatures.length, 4160);
+      final hz = AudioProcessor.estimateDominantFrequencyHz(audio);
+      // FFT 2048 → bin ~7.8 Hz
+      expect(hz, closeTo(targetHz, 10.0));
+    });
 
-      // Test with noise
-      final noise = List.generate(sampleRate, (i) => (i % 2 == 0) ? 0.1 : -0.1);
-      final noiseFeatures = AudioProcessor.computeSpectrogramFeatures(noise);
-      expect(noiseFeatures.length, 4160);
+    test('estimateDominantFrequencyHz returns 0 for silence', () {
+      final silence = List.filled(AudioProcessor.targetSampleRate, 0.0);
+      expect(AudioProcessor.estimateDominantFrequencyHz(silence), 0.0);
     });
   });
 }

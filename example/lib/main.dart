@@ -40,8 +40,6 @@ class _SnoreDetectionDemoState extends State<SnoreDetectionDemo> {
   
   // Recording settings
   bool _enableRecording = false;
-  int _recordingStartDelaySeconds = 3;
-  int _recordingStopDelaySeconds = 2;
   final List<SnoreRecordingInfo> _recordings = [];
   bool _isLoadingRecordings = false;
 
@@ -186,8 +184,10 @@ class _SnoreDetectionDemoState extends State<SnoreDetectionDemo> {
         confidenceThreshold: _confidenceThreshold,
         verboseDebug: _verboseDebug,
         enableRecording: _enableRecording,
-        recordingStartDelay: Duration(seconds: _recordingStartDelaySeconds),
-        recordingStopDelay: Duration(seconds: _recordingStopDelaySeconds),
+        episodeOpenSnoreCount: 3,
+        episodeOpenWindow: const Duration(seconds: 30),
+        episodeCloseSilence: const Duration(seconds: 90),
+        minEpisodeDuration: const Duration(seconds: 60),
         onResult: (result) {
           if (_verboseDebug) {
             // ignore: avoid_print
@@ -212,6 +212,19 @@ class _SnoreDetectionDemoState extends State<SnoreDetectionDemo> {
             }
           });
         },
+        onRecordingSaved: (info) {
+          setState(() {
+            _statusMessage =
+                'Episode saved (${info.duration.inSeconds}s, ${info.snoreEventCount} snores)';
+          });
+          _loadRecordings();
+        },
+        onEpisodeDiscarded: (duration) {
+          setState(() {
+            _statusMessage =
+                'Episode discarded (${duration.inSeconds}s < 60s)';
+          });
+        },
         onError: (error) {
           if (_verboseDebug) {
             // ignore: avoid_print
@@ -220,17 +233,6 @@ class _SnoreDetectionDemoState extends State<SnoreDetectionDemo> {
           setState(() {
             _statusMessage = 'Error: $error';
           });
-        },
-        onRecordingSaved: (info) {
-          // ignore: avoid_print
-          print('✅ Recording saved: ${info.filePath}');
-          // ignore: avoid_print
-          print('   Duration: ${info.duration.inSeconds}s');
-          // ignore: avoid_print
-          print('   Start: ${info.startTimestamp}');
-          
-          // Reload recordings list
-          _loadRecordings();
         },
       );
     } catch (e) {
@@ -442,7 +444,7 @@ class _SnoreDetectionDemoState extends State<SnoreDetectionDemo> {
                               ),
                             ),
                             subtitle: const Text(
-                              'Automatically record audio when snoring is detected',
+                              'Record confirmed snore episodes (3 in 30s / 90s close / 60s min)',
                               style: TextStyle(fontSize: 12, color: Colors.grey),
                             ),
                             value: _enableRecording,
@@ -452,55 +454,10 @@ class _SnoreDetectionDemoState extends State<SnoreDetectionDemo> {
                           ),
                           
                           if (_enableRecording) ...[
-                            const SizedBox(height: 16),
-                            
-                            // Recording Start Delay
-                            Text(
-                              'Recording Start Delay: ${_recordingStartDelaySeconds}s',
-                              style: const TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
                             const SizedBox(height: 8),
-                            Slider(
-                              value: _recordingStartDelaySeconds.toDouble(),
-                              min: 1,
-                              max: 10,
-                              divisions: 9,
-                              label: '${_recordingStartDelaySeconds}s',
-                              onChanged: (value) {
-                                setState(() => _recordingStartDelaySeconds = value.toInt());
-                              },
-                            ),
                             const Text(
-                              'Minimum snore duration before recording starts',
-                              style: TextStyle(fontSize: 12, color: Colors.grey),
-                            ),
-                            
-                            const SizedBox(height: 16),
-                            
-                            // Recording Stop Delay
-                            Text(
-                              'Recording Stop Delay: ${_recordingStopDelaySeconds}s',
-                              style: const TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Slider(
-                              value: _recordingStopDelaySeconds.toDouble(),
-                              min: 1,
-                              max: 10,
-                              divisions: 9,
-                              label: '${_recordingStopDelaySeconds}s',
-                              onChanged: (value) {
-                                setState(() => _recordingStopDelaySeconds = value.toInt());
-                              },
-                            ),
-                            const Text(
-                              'Minimum noise duration before recording stops',
+                              'Episode rules: open after 3 rhythmic snores in 30s, '
+                              'close after 90s silence, discard under 60s.',
                               style: TextStyle(fontSize: 12, color: Colors.grey),
                             ),
                           ],

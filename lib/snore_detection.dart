@@ -8,7 +8,7 @@
 ///
 /// - Real-time snoring detection from device microphone
 /// - File-based detection for analyzing pre-recorded audio
-/// - Automatic audio recording when snoring is detected
+/// - Automatic episode recording (3 events / 2–11s gaps, 11s silence close)
 /// - Configurable confidence thresholds
 /// - Cross-platform support (iOS and Android)
 /// - Low memory footprint with quantized model
@@ -31,16 +31,18 @@
 ///   },
 /// );
 ///
-/// // Live detection with automatic recording
+/// // Live detection with automatic episode recording
 /// await detector.startLiveDetection(
 ///   enableRecording: true,
-///   recordingStartDelay: const Duration(seconds: 3),
-///   recordingStopDelay: const Duration(seconds: 2),
+///   episodeOpenSnoreCount: 3,
+///   episodeOpenWindow: const Duration(seconds: 30),
+///   episodeCloseSilence: const Duration(seconds: 90),
+///   minEpisodeDuration: const Duration(seconds: 60),
 ///   onResult: (result) {
 ///     // Detection results
 ///   },
 ///   onRecordingSaved: (info) {
-///     print('Saved: ${info.filePath}');
+///     print('Saved episode: ${info.filePath}');
 ///   },
 /// );
 ///

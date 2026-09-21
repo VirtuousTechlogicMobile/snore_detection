@@ -170,6 +170,38 @@ class AudioProcessor {
     return audio.map((s) => s / maxAbs).toList();
   }
 
+  /// Dominant frequency (Hz) via FFT peak in [[minHz], [maxHz]] on a 1s window.
+  ///
+  /// Returns `0` when the peak is below [minPeakMagnitude] (too quiet / no peak).
+  static double estimateDominantFrequencyHz(
+    List<double> audioWindow, {
+    double minHz = 20,
+    double maxHz = 400,
+    int fftSize = 2048,
+    double minPeakMagnitude = 1e-3,
+  }) {
+    if (audioWindow.isEmpty) return 0.0;
+
+    final magnitudes = _computeFFT(audioWindow, fftSize);
+    final binHz = targetSampleRate / fftSize;
+    final minBin = math.max(1, (minHz / binHz).floor());
+    final maxBin = math.min(magnitudes.length - 1, (maxHz / binHz).ceil());
+
+    if (minBin > maxBin) return 0.0;
+
+    var peakBin = minBin;
+    var peakMag = magnitudes[minBin];
+    for (var i = minBin + 1; i <= maxBin; i++) {
+      if (magnitudes[i] > peakMag) {
+        peakMag = magnitudes[i];
+        peakBin = i;
+      }
+    }
+
+    if (peakMag < minPeakMagnitude) return 0.0;
+    return peakBin * binHz;
+  }
+
   /// Convert Int16 PCM data to normalized doubles
   static List<double> int16ToDouble(List<int> pcmData) {
     return pcmData.map((sample) => sample / 32768.0).toList();

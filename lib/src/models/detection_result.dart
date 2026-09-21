@@ -21,6 +21,9 @@ class DetectionResult {
   /// was present in the analyzed audio window.
   final double noiseConfidence;
 
+  /// Dominant frequency (Hz) from FFT peak in the snore band, or `0` if none.
+  final double dominantFrequencyHz;
+
   /// Timestamp when this detection occurred.
   ///
   /// Defaults to [DateTime.now()] if not explicitly provided.
@@ -33,6 +36,7 @@ class DetectionResult {
     required this.isSnoring,
     required this.snoringConfidence,
     required this.noiseConfidence,
+    this.dominantFrequencyHz = 0.0,
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now();
 
@@ -41,25 +45,13 @@ class DetectionResult {
   /// Classifies as snoring only if:
   /// - [snoringConfidence] exceeds [threshold]
   /// - [snoringConfidence] is higher than [noiseConfidence]
-  ///
-  /// This helps reduce false positives by requiring a minimum confidence level.
-  ///
-  /// Example:
-  /// ```dart
-  /// final result = DetectionResult.withThreshold(
-  ///   snoringConfidence: 0.85,
-  ///   noiseConfidence: 0.15,
-  ///   threshold: 0.7,  // Require 70% confidence
-  /// );
-  /// print(result.isSnoring); // true (85% > 70% and 85% > 15%)
-  /// ```
   factory DetectionResult.withThreshold({
     required double snoringConfidence,
     required double noiseConfidence,
     required double threshold,
+    double dominantFrequencyHz = 0.0,
     DateTime? timestamp,
   }) {
-    // Only classify as snoring if confidence exceeds threshold
     final isSnoring =
         snoringConfidence > threshold && snoringConfidence > noiseConfidence;
 
@@ -67,20 +59,36 @@ class DetectionResult {
       isSnoring: isSnoring,
       snoringConfidence: snoringConfidence,
       noiseConfidence: noiseConfidence,
+      dominantFrequencyHz: dominantFrequencyHz,
       timestamp: timestamp,
     );
   }
 
+  /// Copy with optional field overrides.
+  DetectionResult copyWith({
+    bool? isSnoring,
+    double? snoringConfidence,
+    double? noiseConfidence,
+    double? dominantFrequencyHz,
+    DateTime? timestamp,
+  }) {
+    return DetectionResult(
+      isSnoring: isSnoring ?? this.isSnoring,
+      snoringConfidence: snoringConfidence ?? this.snoringConfidence,
+      noiseConfidence: noiseConfidence ?? this.noiseConfidence,
+      dominantFrequencyHz: dominantFrequencyHz ?? this.dominantFrequencyHz,
+      timestamp: timestamp ?? this.timestamp,
+    );
+  }
+
   /// Returns the confidence score of the predicted class.
-  ///
-  /// Returns [snoringConfidence] if [isSnoring] is true,
-  /// otherwise returns [noiseConfidence].
   double get confidence => isSnoring ? snoringConfidence : noiseConfidence;
 
   @override
   String toString() {
     return 'DetectionResult(isSnoring: $isSnoring, confidence: ${confidence.toStringAsFixed(3)}, '
         'snoringConf: ${snoringConfidence.toStringAsFixed(3)}, '
-        'noiseConf: ${noiseConfidence.toStringAsFixed(3)})';
+        'noiseConf: ${noiseConfidence.toStringAsFixed(3)}, '
+        'freqHz: ${dominantFrequencyHz.toStringAsFixed(1)})';
   }
 }

@@ -1,4 +1,4 @@
-import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import '../models/detection_result.dart';
 import '../models/snore_recording_info.dart';
@@ -6,219 +6,382 @@ import '../utils/wav_writer.dart';
 import '../utils/audio_processor.dart';
 import 'recording_storage_service.dart';
 
-/// Recording states for the state machine
+/// Recording states for episode-based snore capture.
 enum RecordingState {
   idle,
-  pendingStart,
   recording,
-  pendingStop,
+  pendingClose,
 }
 
-/// State machine for managing recording lifecycle during live detection.
-///
-/// **CRITICAL: No Microphone Access**
-/// This class does NOT open a microphone. It receives raw PCM audio samples
-/// from the SHARED microphone stream that is also used for snore detection.
-/// The microphone is opened ONCE by [AudioRecorderService] and the same audio
-/// frames are delivered to both detection and this recording state machine.
-///
-/// Handles the logic for starting/stopping recordings based on detection
-/// results with configurable start and stop delays.
-class RecordingStateMachine {
+/// Timed discrete snore event (start + end/offset).
+class _SnoreEventMark {
+  DateTime start;
+  DateTime end;
 
-  final RecordingStorageService _storageService = RecordingStorageService();
-  final Duration recordingStartDelay;
-  final Duration recordingStopDelay;
+  _SnoreEventMark(this.start) : end = start;
+}
+
+/// Timed PCM chunk for the rolling pre-open buffer.
+class _PcmChunk {
+  final DateTime timestamp;
+  final List<int> samples;
+
+  _PcmChunk(this.timestamp, this.samples);
+}
+
+/// State machine for episode-based recording during live detection.
+///
+/// Client heuristic (locked defaults):
+/// - Discrete snore events; gaps outside [[minInterSnoreGap], [maxInterSnoreGap]]
+///   reset the idle candidate chain.
+/// - Open after [episodeOpenSnoreCount] consecutive events with valid gaps;
+///   start backdated to the first of those events.
+/// - Close after [episodeCloseSilence] with no new snore event (from event end).
+/// - Save if event count ≥ open count; optional [minEpisodeDuration] floor.
+/// - Trim trailing close-silence from the saved WAV.
+class RecordingStateMachine {
+  final RecordingStorageService _storageService;
+  final int episodeOpenSnoreCount;
+  final Duration episodeOpenWindow;
+  final Duration episodeCloseSilence;
+  final Duration minEpisodeDuration;
+  final Duration minInterSnoreGap;
+  final Duration maxInterSnoreGap;
+  final Duration snoreBurstEndSilence;
+  final bool requireMinSnoreEventsToSave;
+  /// When true, open/extend gaps use previous event end → next event start.
+  final bool measureGapsFromEventEnd;
   final String Function(int index, DateTime startTimestamp)? fileNameBuilder;
   final void Function(SnoreRecordingInfo info)? onRecordingSaved;
+  final void Function(Duration duration)? onEpisodeDiscarded;
+  final DateTime Function() _clock;
 
   RecordingState _state = RecordingState.idle;
-  DateTime? _pendingStartTime;
-  DateTime? _pendingStopTime;
   WavWriter? _wavWriter;
   File? _currentRecordingFile;
-  DateTime? _recordingStartTime;
+  DateTime? _episodeStartTime;
+  DateTime? _lastActivityTime;
+  /// End/offset of the last discrete snore event (close timer anchor).
+  DateTime? _lastSnoreEventEndTime;
   int _recordingIndex = 0;
   final List<int> _audioBuffer = [];
 
-  /// Creates a recording state machine.
+  /// Discrete snore events in the candidate chain / episode.
+  final ListQueue<_SnoreEventMark> _snoreEvents = ListQueue<_SnoreEventMark>();
+  final List<int> _interSnoreGapsMs = [];
+  int _episodeSnoreEventCount = 0;
+
+  bool _inSnoreBurst = false;
+  DateTime? _burstQuietSince;
+
+  /// Rolling PCM for seeding WAV when an episode opens.
+  final ListQueue<_PcmChunk> _rollingPcm = ListQueue<_PcmChunk>();
+
+  /// Quiet audio held during pendingClose; flushed on resume, dropped on finalize.
+  final List<int> _pendingClosePcm = [];
+
+  /// Creates a recording state machine with client episode defaults.
   RecordingStateMachine({
-    required this.recordingStartDelay,
-    required this.recordingStopDelay,
+    this.episodeOpenSnoreCount = 3,
+    this.episodeOpenWindow = const Duration(seconds: 22),
+    this.episodeCloseSilence = const Duration(seconds: 11),
+    this.minEpisodeDuration = Duration.zero,
+    this.minInterSnoreGap = const Duration(seconds: 2),
+    this.maxInterSnoreGap = const Duration(seconds: 11),
+    this.snoreBurstEndSilence = const Duration(seconds: 2),
+    this.requireMinSnoreEventsToSave = true,
+    this.measureGapsFromEventEnd = true,
     this.fileNameBuilder,
     this.onRecordingSaved,
-  });
+    this.onEpisodeDiscarded,
+    RecordingStorageService? storageService,
+    DateTime Function()? clock,
+  })  : _storageService = storageService ?? RecordingStorageService(),
+        _clock = clock ?? DateTime.now;
 
-  /// Processes a detection result and updates state accordingly.
+  /// Processes a detection result and updates episode state.
   ///
-  /// **SINGLE MICROPHONE STREAM**: The [audioSamples] parameter contains raw PCM
-  /// samples from the SHARED microphone stream (same source as snore detection).
-  /// This method does NOT open a separate microphone - it only writes the
-  /// received samples to a WAV file when in the recording state.
-  ///
-  /// This should be called for each detection result from live detection.
-  /// The state machine will automatically start/stop recordings based on
-  /// the detection results and configured delays.
+  /// [audioSamples] are raw PCM Int16 samples from the shared mic stream
+  /// for this ~1s window.
   Future<void> processDetectionResult(
     DetectionResult result,
-    List<int> audioSamples, // Raw PCM from shared mic stream
-  ) async {
-    final now = DateTime.now();
+    List<int> audioSamples, {
+    DateTime? now,
+  }) async {
+    final timestamp = now ?? _clock();
     final isSnoring = result.isSnoring;
+
+    _appendRollingPcm(timestamp, audioSamples);
+    final discreteSnore = _updateDiscreteSnore(isSnoring, timestamp);
 
     switch (_state) {
       case RecordingState.idle:
-        if (isSnoring) {
-          // Transition to pendingStart
-          _state = RecordingState.pendingStart;
-          _pendingStartTime = now;
-        }
-        break;
-
-      case RecordingState.pendingStart:
-        if (isSnoring) {
-          // Check if start delay has elapsed
-          final elapsed = now.difference(_pendingStartTime!);
-          if (elapsed >= recordingStartDelay) {
-            // Start recording
-            await _startRecording(now);
+        if (discreteSnore) {
+          _registerSnoreEvent(timestamp, forEpisode: false);
+          if (_shouldOpenEpisode(timestamp)) {
+            await _openEpisode(timestamp);
           }
-        } else {
-          // Snoring stopped before delay elapsed - cancel
-          _state = RecordingState.idle;
-          _pendingStartTime = null;
         }
         break;
 
       case RecordingState.recording:
-        // Write audio samples to file
         _audioBuffer.addAll(audioSamples);
+        if (_audioBuffer.length >= AudioProcessor.targetSampleRate) {
+          await _writeAudioBuffer();
+        }
 
-        if (isSnoring) {
-          // Continue recording
-          // Flush buffer periodically (every ~1 second worth of samples)
+        if (discreteSnore) {
+          _registerSnoreEvent(timestamp, forEpisode: true);
+          _lastActivityTime = timestamp;
+        } else if (isSnoring) {
+          _lastActivityTime = timestamp;
+        } else {
+          _state = RecordingState.pendingClose;
+          _pendingClosePcm
+            ..clear()
+            ..addAll(audioSamples);
+          _audioBuffer.clear();
+        }
+        break;
+
+      case RecordingState.pendingClose:
+        if (isSnoring || discreteSnore) {
+          // Merge: flush quiet gap into file and continue episode.
+          if (_pendingClosePcm.isNotEmpty) {
+            _audioBuffer.addAll(_pendingClosePcm);
+            _pendingClosePcm.clear();
+            await _writeAudioBuffer();
+          }
+          _state = RecordingState.recording;
+          _audioBuffer.addAll(audioSamples);
           if (_audioBuffer.length >= AudioProcessor.targetSampleRate) {
             await _writeAudioBuffer();
           }
-        } else {
-          // Transition to pendingStop
-          _state = RecordingState.pendingStop;
-          _pendingStopTime = now;
-        }
-        break;
-
-      case RecordingState.pendingStop:
-        if (isSnoring) {
-          // Snoring resumed - go back to recording
-          _state = RecordingState.recording;
-          _pendingStopTime = null;
-        } else {
-          // Check if stop delay has elapsed
-          final elapsed = now.difference(_pendingStopTime!);
-          if (elapsed >= recordingStopDelay) {
-            // Stop recording
-            await _stopRecording(now);
+          if (discreteSnore) {
+            _registerSnoreEvent(timestamp, forEpisode: true);
           }
+          _lastActivityTime = timestamp;
+        } else {
+          _pendingClosePcm.addAll(audioSamples);
         }
         break;
     }
+
+    await _maybeCloseForSilence(timestamp);
   }
 
-  /// Starts a new recording.
-  Future<void> _startRecording(DateTime startTime) async {
-    try {
-      _recordingIndex++;
-      _recordingStartTime = startTime;
-
-      // Create file path
-      final filePath = await _storageService.createRecordingFilePath(
-        index: _recordingIndex,
-        timestamp: startTime,
-        fileNameBuilder: fileNameBuilder,
-      );
-
-      _currentRecordingFile = File(filePath);
-
-      // Create WAV writer
-      _wavWriter = WavWriter(
-        file: _currentRecordingFile!,
-        sampleRate: AudioProcessor.targetSampleRate,
-        numChannels: 1,
-        bitsPerSample: 16,
-      );
-
-      await _wavWriter!.open();
-      _audioBuffer.clear();
-
-      _state = RecordingState.recording;
-    } catch (e) {
-      // Error starting recording - reset state
-      _state = RecordingState.idle;
-      _pendingStartTime = null;
-      _wavWriter = null;
-      _currentRecordingFile = null;
-      rethrow;
+  /// Close when [episodeCloseSilence] has passed since last snore event end
+  /// and we are not currently in a snore burst / snoring frame.
+  Future<void> _maybeCloseForSilence(DateTime timestamp) async {
+    if (_state != RecordingState.recording &&
+        _state != RecordingState.pendingClose) {
+      return;
+    }
+    if (_inSnoreBurst) return;
+    final eventEnd = _lastSnoreEventEndTime;
+    if (eventEnd == null) return;
+    if (timestamp.difference(eventEnd) >= episodeCloseSilence) {
+      await _finalizeEpisode(timestamp);
     }
   }
 
-  /// Stops the current recording and saves metadata.
-  Future<void> _stopRecording(DateTime stopTime) async {
-    if (_wavWriter == null || _currentRecordingFile == null) {
-      _state = RecordingState.idle;
+  bool _updateDiscreteSnore(bool isSnoring, DateTime now) {
+    if (isSnoring) {
+      _burstQuietSince = null;
+      if (!_inSnoreBurst) {
+        _inSnoreBurst = true;
+        return true;
+      }
+      return false;
+    }
+
+    // Non-snore frame
+    if (_inSnoreBurst) {
+      _burstQuietSince ??= now;
+      if (now.difference(_burstQuietSince!) >= snoreBurstEndSilence) {
+        _inSnoreBurst = false;
+        // Event end/offset = when the burst is considered finished.
+        _lastSnoreEventEndTime = now;
+        if (_snoreEvents.isNotEmpty) {
+          _snoreEvents.last.end = now;
+        }
+        _burstQuietSince = null;
+      }
+    }
+    return false;
+  }
+
+  Duration _gapToPrevious(_SnoreEventMark previous, DateTime nextStart) {
+    if (measureGapsFromEventEnd) {
+      return nextStart.difference(previous.end);
+    }
+    return nextStart.difference(previous.start);
+  }
+
+  void _registerSnoreEvent(DateTime timestamp, {required bool forEpisode}) {
+    if (_snoreEvents.isNotEmpty) {
+      final gap = _gapToPrevious(_snoreEvents.last, timestamp);
+
+      // Too close → ignore (same snore / fragment).
+      if (gap < minInterSnoreGap) {
+        return;
+      }
+
+      // Idle candidate: gap too large → start a fresh candidate chain.
+      if (!forEpisode &&
+          _state == RecordingState.idle &&
+          gap > maxInterSnoreGap) {
+        _snoreEvents.clear();
+      } else if (forEpisode || _state != RecordingState.idle) {
+        _interSnoreGapsMs.add(gap.inMilliseconds);
+      }
+    }
+
+    _snoreEvents.addLast(_SnoreEventMark(timestamp));
+    // Event end initially at start; updated when burst ends.
+    _lastSnoreEventEndTime = timestamp;
+    _pruneSnoreEvents(timestamp);
+
+    if (forEpisode || _state == RecordingState.recording) {
+      _episodeSnoreEventCount++;
+    }
+  }
+
+  void _pruneSnoreEvents(DateTime now) {
+    while (_snoreEvents.isNotEmpty &&
+        now.difference(_snoreEvents.first.start) > episodeOpenWindow) {
+      _snoreEvents.removeFirst();
+    }
+  }
+
+  bool _shouldOpenEpisode([DateTime? now]) {
+    _pruneSnoreEvents(now ?? _clock());
+    if (_snoreEvents.length < episodeOpenSnoreCount) {
+      return false;
+    }
+
+    final recent = _snoreEvents.toList().sublist(
+          _snoreEvents.length - episodeOpenSnoreCount,
+        );
+
+    for (var i = 1; i < recent.length; i++) {
+      final gap = _gapToPrevious(recent[i - 1], recent[i].start);
+      if (gap < minInterSnoreGap || gap > maxInterSnoreGap) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void _appendRollingPcm(DateTime timestamp, List<int> samples) {
+    _rollingPcm.addLast(_PcmChunk(timestamp, List<int>.from(samples)));
+    final cutoff = timestamp.subtract(episodeOpenWindow);
+    while (_rollingPcm.isNotEmpty &&
+        _rollingPcm.first.timestamp.isBefore(cutoff)) {
+      _rollingPcm.removeFirst();
+    }
+  }
+
+  Future<void> _openEpisode(DateTime openTime) async {
+    final recent = _snoreEvents.toList().sublist(
+          _snoreEvents.length - episodeOpenSnoreCount,
+        );
+    final seedFrom = recent.first.start;
+
+    _episodeStartTime = seedFrom;
+    _lastActivityTime = openTime;
+    _lastSnoreEventEndTime = recent.last.end;
+    _episodeSnoreEventCount = episodeOpenSnoreCount;
+    _interSnoreGapsMs.clear();
+    for (var i = 1; i < recent.length; i++) {
+      _interSnoreGapsMs
+          .add(_gapToPrevious(recent[i - 1], recent[i].start).inMilliseconds);
+    }
+
+    _recordingIndex++;
+    final filePath = await _storageService.createRecordingFilePath(
+      index: _recordingIndex,
+      timestamp: seedFrom,
+      fileNameBuilder: fileNameBuilder,
+    );
+
+    _currentRecordingFile = File(filePath);
+    _wavWriter = WavWriter(
+      file: _currentRecordingFile!,
+      sampleRate: AudioProcessor.targetSampleRate,
+      numChannels: 1,
+      bitsPerSample: 16,
+    );
+    await _wavWriter!.open();
+    _audioBuffer.clear();
+
+    for (final chunk in _rollingPcm) {
+      if (!chunk.timestamp.isBefore(seedFrom)) {
+        _audioBuffer.addAll(chunk.samples);
+      }
+    }
+    if (_audioBuffer.isNotEmpty) {
+      await _writeAudioBuffer();
+    }
+
+    _state = RecordingState.recording;
+    _pendingClosePcm.clear();
+  }
+
+  Future<void> _finalizeEpisode(DateTime closeTime) async {
+    if (_wavWriter == null ||
+        _currentRecordingFile == null ||
+        _episodeStartTime == null) {
+      _resetToIdle();
       return;
     }
 
-    try {
-      // Write any remaining audio buffer
-      if (_audioBuffer.isNotEmpty) {
-        await _writeAudioBuffer();
-      }
-
-      // Close WAV file
-      await _wavWriter!.close();
-
-      // Calculate duration
-      final duration = stopTime.difference(_recordingStartTime!);
-
-      // Create recording info
-      final recordingInfo = SnoreRecordingInfo(
-        filePath: _currentRecordingFile!.absolute.path,
-        startTimestamp: _recordingStartTime!,
-        duration: duration,
-      );
-
-      // Save metadata
-      await _storageService.saveRecordingMetadata(recordingInfo);
-
-      // Call callback
-      onRecordingSaved?.call(recordingInfo);
-
-      // Reset state
-      _state = RecordingState.idle;
-      _wavWriter = null;
-      _currentRecordingFile = null;
-      _recordingStartTime = null;
-      _audioBuffer.clear();
-    } catch (e) {
-      // Error stopping recording - try to clean up
-      _state = RecordingState.idle;
-      _wavWriter = null;
-      _currentRecordingFile = null;
-      _recordingStartTime = null;
-      _audioBuffer.clear();
-      rethrow;
+    _pendingClosePcm.clear();
+    if (_audioBuffer.isNotEmpty) {
+      await _writeAudioBuffer();
     }
+
+    await _wavWriter!.close();
+
+    final activityEnd = _lastActivityTime ?? _episodeStartTime!;
+    final keptDuration = activityEnd.difference(_episodeStartTime!);
+
+    final file = _currentRecordingFile!;
+    final path = file.absolute.path;
+
+    final tooFewEvents = requireMinSnoreEventsToSave &&
+        _episodeSnoreEventCount < episodeOpenSnoreCount;
+    final tooShort = minEpisodeDuration > Duration.zero &&
+        keptDuration < minEpisodeDuration;
+
+    if (tooFewEvents || tooShort) {
+      if (await file.exists()) {
+        await file.delete();
+      }
+      onEpisodeDiscarded?.call(keptDuration);
+      _resetToIdle();
+      return;
+    }
+
+    final info = SnoreRecordingInfo(
+      filePath: path,
+      startTimestamp: _episodeStartTime!,
+      duration: keptDuration,
+      snoreEventCount: _episodeSnoreEventCount,
+      interSnoreGapsMs: List<int>.from(_interSnoreGapsMs),
+    );
+
+    await _storageService.saveRecordingMetadata(info);
+    onRecordingSaved?.call(info);
+    _resetToIdle();
   }
 
-  /// Writes buffered audio samples to file.
   Future<void> _writeAudioBuffer() async {
     if (_wavWriter == null || _audioBuffer.isEmpty) {
       return;
     }
 
-    // Write samples (convert to Int16 range)
     final samples = _audioBuffer.map((sample) {
-      // Clamp to Int16 range
       return sample.clamp(-32768, 32767);
     }).toList();
 
@@ -226,29 +389,57 @@ class RecordingStateMachine {
     _audioBuffer.clear();
   }
 
+  void _resetToIdle() {
+    _state = RecordingState.idle;
+    _wavWriter = null;
+    _currentRecordingFile = null;
+    _episodeStartTime = null;
+    _lastActivityTime = null;
+    _lastSnoreEventEndTime = null;
+    _audioBuffer.clear();
+    _pendingClosePcm.clear();
+    _interSnoreGapsMs.clear();
+    _episodeSnoreEventCount = 0;
+    final now = _clock();
+    _pruneSnoreEvents(now);
+  }
+
+  /// Finalizes any active episode (save or discard) without clearing candidates.
+  Future<void> finalizeActiveEpisode() async {
+    if (_state == RecordingState.recording ||
+        _state == RecordingState.pendingClose) {
+      await _finalizeEpisode(_clock());
+    }
+  }
+
   /// Stops any active recording and resets state.
-  ///
-  /// This should be called when live detection stops to ensure
-  /// any active recording is properly finalized.
   Future<void> stop() async {
-    if (_state == RecordingState.recording || _state == RecordingState.pendingStop) {
-      // Finalize current recording
-      await _stopRecording(DateTime.now());
+    if (_state == RecordingState.recording ||
+        _state == RecordingState.pendingClose) {
+      await _finalizeEpisode(_clock());
     }
 
     _state = RecordingState.idle;
-    _pendingStartTime = null;
-    _pendingStopTime = null;
     _wavWriter = null;
     _currentRecordingFile = null;
-    _recordingStartTime = null;
+    _episodeStartTime = null;
+    _lastActivityTime = null;
+    _lastSnoreEventEndTime = null;
     _audioBuffer.clear();
+    _pendingClosePcm.clear();
+    _snoreEvents.clear();
+    _interSnoreGapsMs.clear();
+    _episodeSnoreEventCount = 0;
+    _rollingPcm.clear();
+    _inSnoreBurst = false;
+    _burstQuietSince = null;
   }
 
   /// Gets the current state.
   RecordingState get state => _state;
 
-  /// Whether a recording is currently active.
-  bool get isRecording => _state == RecordingState.recording;
+  /// Whether a recording is currently active (including pending close).
+  bool get isRecording =>
+      _state == RecordingState.recording ||
+      _state == RecordingState.pendingClose;
 }
-

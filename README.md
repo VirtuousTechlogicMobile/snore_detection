@@ -57,14 +57,15 @@ detector.startLiveDetection(
 await detector.stopLiveDetection();
 ```
 
-### Recording Snore Audio Clips
+### Recording Snore Episodes
 
-The package can automatically record audio clips when snoring is detected during live detection. This feature is optional and disabled by default to maintain backward compatibility.
+The package can automatically record audio when a snore **episode** is confirmed during live detection. This feature is optional and disabled by default.
 
 **Key Features:**
-- **No fixed recording window**: Recording continues as long as snoring is detected
-- **Configurable delays**: Set minimum snore duration before recording starts and minimum noise duration before stopping
-- **Multiple files**: Each distinct snore episode becomes a separate audio file
+- **Episode open**: Requires ~3 rhythmic discrete snores within 30 seconds
+- **Episode close / merge**: Closes after 90 seconds of silence; shorter gaps stay in the same episode
+- **Min duration**: Episodes under 60 seconds are discarded
+- **Gap metadata**: Saved recordings include inter-snore gap stats
 - **Automatic management**: Files are saved with metadata for easy listing and deletion
 
 **Basic Usage:**
@@ -82,25 +83,32 @@ if (!hasStoragePermission) {
   return;
 }
 
-// Start detection with recording enabled
+// Start detection with episode recording enabled
 await detector.startLiveDetection(
   onResult: (result) {
     // Detection results (same as before)
     print('Snoring: ${result.isSnoring}');
   },
   enableRecording: true,
-  recordingStartDelay: const Duration(seconds: 3),  // Wait 3s of snoring before recording
-  recordingStopDelay: const Duration(seconds: 2),   // Wait 2s of noise before stopping
+  episodeOpenSnoreCount: 3,
+  episodeOpenWindow: const Duration(seconds: 30),
+  episodeCloseSilence: const Duration(seconds: 90),
+  minEpisodeDuration: const Duration(seconds: 60),
   onRecordingSaved: (info) {
-    print('Recording saved: ${info.filePath}');
+    print('Episode saved: ${info.filePath}');
     print('Duration: ${info.duration.inSeconds}s');
+    print('Snore events: ${info.snoreEventCount}');
+  },
+  onEpisodeDiscarded: (duration) {
+    print('Episode discarded (${duration.inSeconds}s < 60s)');
   },
 );
 ```
 
 **Behavior:**
-- **Recording Start Delay**: Snoring must be detected continuously for at least `recordingStartDelay` before recording starts. Short snore episodes (< delay) do not create recordings.
-- **Recording Stop Delay**: When snoring stops, the library waits `recordingStopDelay` before actually stopping the recording. If snoring resumes within this delay, the same recording continues (no file split).
+- **Open**: 3 discrete snore bursts in 30s with inter-snore gaps between 2–6s (breath-rate gate).
+- **Close**: After 90s continuous non-snore; quieter pauses merge into one episode.
+- **Discard**: Kept audio shorter than 60s is deleted and not reported via `onRecordingSaved`.
 
 **Managing Recordings:**
 
