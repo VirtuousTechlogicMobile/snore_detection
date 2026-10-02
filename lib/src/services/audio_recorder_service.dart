@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:record/record.dart';
 import 'package:permission_handler/permission_handler.dart';
+import '../snore_live_pcm_listener.dart';
 import '../utils/audio_processor.dart';
 
 /// Service for recording and processing live audio.
@@ -128,6 +129,9 @@ class AudioRecorderService {
   ) {
     // Convert bytes to Int16 PCM samples from the shared mic stream
     final samples = AudioProcessor.bytesToInt16(audioData);
+
+    // Optional UI mic-level hook (same shared stream, no 2nd mic).
+    snoreLivePcmListener?.call(samples);
 
     // Add to buffer
     _audioBuffer.addAll(samples);

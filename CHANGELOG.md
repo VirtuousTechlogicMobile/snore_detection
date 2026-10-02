@@ -1,3 +1,7 @@
+## 0.3.1
+
+* **NEW:** Optional `snoreLivePcmListener` hook for live mic-level UI meters (shared stream, additive/no breaking API)
+
 ## 0.3.0
 
 * **NEW:** Add `requestMicrophonePermission()` method to `SnoreDetector` for explicit permission handling
