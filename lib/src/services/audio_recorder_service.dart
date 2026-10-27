@@ -81,12 +81,15 @@ class AudioRecorderService {
     // Clear buffer
     _audioBuffer.clear();
 
-    // Configure recording
+    // Configure recording — keep AGC/echo/NS off so dBFS levels stay honest.
     const config = RecordConfig(
       encoder: AudioEncoder.pcm16bits,
       sampleRate: AudioProcessor.targetSampleRate,
       numChannels: 1, // Mono
       bitRate: 128000,
+      autoGain: false,
+      echoCancel: false,
+      noiseSuppress: false,
     );
 
     // CRITICAL: Open microphone ONCE via startStream()

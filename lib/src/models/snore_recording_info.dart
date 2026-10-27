@@ -22,6 +22,21 @@ class SnoreRecordingInfo {
   /// Largest inter-snore gap in milliseconds, or 0 if fewer than 2 snores.
   final int maxInterSnoreGapMs;
 
+  /// Mean dBFS of snore-event frames only (power-domain average).
+  final double? snoreLevelDb;
+
+  /// dBFS of the loudest single snore event (per-event power mean).
+  final double? maxSnoreDb;
+
+  /// 10th percentile of all episode 100 ms dBFS frames (room floor).
+  final double? noiseFloorDb;
+
+  /// Share of Int16 samples at full scale (0–100).
+  final double? clippedPercent;
+
+  /// Count of inter-snore gaps of 10 s or more inside the episode.
+  final int? pauseCount;
+
   /// Creates a recording info object.
   SnoreRecordingInfo({
     required this.filePath,
@@ -30,6 +45,11 @@ class SnoreRecordingInfo {
     this.snoreEventCount = 0,
     List<int>? interSnoreGapsMs,
     int? maxInterSnoreGapMs,
+    this.snoreLevelDb,
+    this.maxSnoreDb,
+    this.noiseFloorDb,
+    this.clippedPercent,
+    this.pauseCount,
   })  : interSnoreGapsMs = List.unmodifiable(interSnoreGapsMs ?? const []),
         maxInterSnoreGapMs = maxInterSnoreGapMs ??
             ((interSnoreGapsMs == null || interSnoreGapsMs.isEmpty)
@@ -50,6 +70,11 @@ class SnoreRecordingInfo {
       snoreEventCount: (json['snoreEventCount'] as num?)?.toInt() ?? 0,
       interSnoreGapsMs: gaps,
       maxInterSnoreGapMs: (json['maxInterSnoreGapMs'] as num?)?.toInt(),
+      snoreLevelDb: (json['snoreLevelDb'] as num?)?.toDouble(),
+      maxSnoreDb: (json['maxSnoreDb'] as num?)?.toDouble(),
+      noiseFloorDb: (json['noiseFloorDb'] as num?)?.toDouble(),
+      clippedPercent: (json['clippedPercent'] as num?)?.toDouble(),
+      pauseCount: (json['pauseCount'] as num?)?.toInt(),
     );
   }
 
@@ -62,6 +87,11 @@ class SnoreRecordingInfo {
       'snoreEventCount': snoreEventCount,
       'interSnoreGapsMs': interSnoreGapsMs,
       'maxInterSnoreGapMs': maxInterSnoreGapMs,
+      if (snoreLevelDb != null) 'snoreLevelDb': snoreLevelDb,
+      if (maxSnoreDb != null) 'maxSnoreDb': maxSnoreDb,
+      if (noiseFloorDb != null) 'noiseFloorDb': noiseFloorDb,
+      if (clippedPercent != null) 'clippedPercent': clippedPercent,
+      if (pauseCount != null) 'pauseCount': pauseCount,
     };
   }
 
@@ -70,6 +100,7 @@ class SnoreRecordingInfo {
     return 'SnoreRecordingInfo(filePath: $filePath, '
         'startTimestamp: $startTimestamp, duration: ${duration.inSeconds}s, '
         'snoreEventCount: $snoreEventCount, '
-        'maxInterSnoreGapMs: $maxInterSnoreGapMs)';
+        'maxInterSnoreGapMs: $maxInterSnoreGapMs, '
+        'snoreLevelDb: $snoreLevelDb, maxSnoreDb: $maxSnoreDb)';
   }
 }

@@ -2,6 +2,7 @@ import 'dart:collection';
 import 'dart:io';
 import '../models/detection_result.dart';
 import '../models/snore_recording_info.dart';
+import '../utils/level_meter.dart';
 import '../utils/wav_writer.dart';
 import '../utils/audio_processor.dart';
 import 'recording_storage_service.dart';
@@ -79,6 +80,15 @@ class RecordingStateMachine {
 
   /// Quiet audio held during pendingClose; flushed on resume, dropped on finalize.
   final List<int> _pendingClosePcm = [];
+
+  /// Durable snore marks for the open episode (not pruned by open window).
+  final List<_SnoreEventMark> _episodeLevelEvents = [];
+
+  /// 100 ms dBFS meter over samples written to the episode WAV.
+  LevelMeter? _levelMeter;
+  final List<double> _episodeDbFrames = [];
+
+  static const int _pauseGapMs = 10000;
 
   /// Creates a recording state machine with client episode defaults.
   RecordingStateMachine({
@@ -205,6 +215,9 @@ class RecordingStateMachine {
         if (_snoreEvents.isNotEmpty) {
           _snoreEvents.last.end = now;
         }
+        if (_episodeLevelEvents.isNotEmpty) {
+          _episodeLevelEvents.last.end = now;
+        }
         _burstQuietSince = null;
       }
     }
@@ -244,6 +257,10 @@ class RecordingStateMachine {
 
     if (forEpisode || _state == RecordingState.recording) {
       _episodeSnoreEventCount++;
+    }
+    // Durable list for levels — open pattern is seeded in [_openEpisode].
+    if (_state == RecordingState.recording) {
+      _episodeLevelEvents.add(_SnoreEventMark(timestamp));
     }
   }
 
@@ -297,6 +314,12 @@ class RecordingStateMachine {
       _interSnoreGapsMs
           .add(_gapToPrevious(recent[i - 1], recent[i].start).inMilliseconds);
     }
+
+    _episodeLevelEvents
+      ..clear()
+      ..addAll(recent.map((e) => _SnoreEventMark(e.start)..end = e.end));
+    _levelMeter = LevelMeter(sampleRate: AudioProcessor.targetSampleRate);
+    _episodeDbFrames.clear();
 
     _recordingIndex++;
     final filePath = await _storageService.createRecordingFilePath(
@@ -363,12 +386,21 @@ class RecordingStateMachine {
       return;
     }
 
+    final levels = _computeEpisodeLevels(activityEnd);
+    final pauseCount =
+        _interSnoreGapsMs.where((g) => g >= _pauseGapMs).length;
+
     final info = SnoreRecordingInfo(
       filePath: path,
       startTimestamp: _episodeStartTime!,
       duration: keptDuration,
       snoreEventCount: _episodeSnoreEventCount,
       interSnoreGapsMs: List<int>.from(_interSnoreGapsMs),
+      snoreLevelDb: levels?.snoreLevelDb,
+      maxSnoreDb: levels?.maxSnoreDb,
+      noiseFloorDb: levels?.noiseFloorDb,
+      clippedPercent: levels?.clippedPercent,
+      pauseCount: pauseCount,
     );
 
     await _storageService.saveRecordingMetadata(info);
@@ -376,12 +408,48 @@ class RecordingStateMachine {
     _resetToIdle();
   }
 
+  EpisodeLevels? _computeEpisodeLevels(DateTime activityEnd) {
+    final meter = _levelMeter;
+    final start = _episodeStartTime;
+    if (meter == null || start == null) return null;
+
+    // Close any still-open burst at the kept-audio end.
+    if (_episodeLevelEvents.isNotEmpty &&
+        !_episodeLevelEvents.last.end.isAfter(_episodeLevelEvents.last.start)) {
+      _episodeLevelEvents.last.end = activityEnd;
+    }
+
+    final events = _episodeLevelEvents
+        .map(
+          (e) => SnoreLevelEvent(
+            startMs: e.start.difference(start).inMilliseconds.clamp(0, 1 << 30),
+            endMs: e.end.difference(start).inMilliseconds.clamp(0, 1 << 30),
+          ),
+        )
+        .where((e) => e.endMs >= e.startMs)
+        .toList();
+
+    return episodeLevels(
+      frames: List<double>.from(_episodeDbFrames),
+      events: events,
+      frameMs: meter.frameMs,
+      clippedSamples: meter.clippedSamples,
+      totalSamples: meter.totalSamples,
+    );
+  }
+
   Future<void> _writeAudioBuffer() async {
     if (_wavWriter == null || _audioBuffer.isEmpty) {
       return;
     }
 
-    final samples = _audioBuffer.map((sample) {
+    final raw = List<int>.from(_audioBuffer);
+    final meter = _levelMeter;
+    if (meter != null) {
+      _episodeDbFrames.addAll(meter.addSamples(raw));
+    }
+
+    final samples = raw.map((sample) {
       return sample.clamp(-32768, 32767);
     }).toList();
 
@@ -400,6 +468,9 @@ class RecordingStateMachine {
     _pendingClosePcm.clear();
     _interSnoreGapsMs.clear();
     _episodeSnoreEventCount = 0;
+    _episodeLevelEvents.clear();
+    _episodeDbFrames.clear();
+    _levelMeter = null;
     final now = _clock();
     _pruneSnoreEvents(now);
   }
@@ -430,6 +501,9 @@ class RecordingStateMachine {
     _snoreEvents.clear();
     _interSnoreGapsMs.clear();
     _episodeSnoreEventCount = 0;
+    _episodeLevelEvents.clear();
+    _episodeDbFrames.clear();
+    _levelMeter = null;
     _rollingPcm.clear();
     _inSnoreBurst = false;
     _burstQuietSince = null;

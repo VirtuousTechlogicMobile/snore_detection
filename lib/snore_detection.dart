@@ -58,3 +58,4 @@ export 'src/models/detection_result.dart';
 export 'src/models/snore_recording_info.dart';
 export 'src/exceptions/snore_storage_permission_exception.dart';
 export 'src/snore_live_pcm_listener.dart';
+export 'src/utils/level_meter.dart';
