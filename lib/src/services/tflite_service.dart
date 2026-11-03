@@ -1,4 +1,4 @@
-import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:flutter_litert/flutter_litert.dart';
 import '../models/detection_result.dart';
 
 /// TensorFlow Lite inference service for snore detection

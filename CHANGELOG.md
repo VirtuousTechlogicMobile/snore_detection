@@ -1,3 +1,7 @@
+## 0.3.3
+
+* **FIX:** Replace `tflite_flutter` with `flutter_litert` ^3.9.4 so iOS release/App Store builds keep LiteRT C symbols (no manual `STRIP_STYLE`)
+
 ## 0.3.1
 
 * **NEW:** Optional `snoreLivePcmListener` hook for live mic-level UI meters (shared stream, additive/no breaking API)
